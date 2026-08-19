@@ -263,19 +263,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openTerminal() {
-        let script = "tell application \"Terminal\"\nactivate\ndo script \"docker ps\"\nend tell"
-        var error: NSDictionary?
-        if let scriptObject = NSAppleScript(source: script) {
-            scriptObject.executeAndReturnError(&error)
-        }
+        let task = Process()
+        task.launchPath = "/usr/bin/osascript"
+        task.arguments = [
+            "-e", "tell application \"Terminal\" to activate",
+            "-e", "tell application \"Terminal\" to do script \"docker ps\""
+        ]
+        try? task.run()
     }
 
     @objc func openLogs() {
-        let script = "tell application \"Terminal\"\nactivate\ndo script \"tail -n 50 -f ~/.colima/_lima/colima/ha.stderr.log\"\nend tell"
-        var error: NSDictionary?
-        if let scriptObject = NSAppleScript(source: script) {
-            scriptObject.executeAndReturnError(&error)
-        }
+        let task = Process()
+        task.launchPath = "/usr/bin/osascript"
+        task.arguments = [
+            "-e", "tell application \"Terminal\" to activate",
+            "-e", "tell application \"Terminal\" to do script \"tail -n 50 -f " + logPath + "\""
+        ]
+        try? task.run()
     }
 
     @objc func showAbout() {
