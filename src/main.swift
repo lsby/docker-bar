@@ -263,7 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openTerminal() {
-        let script = "tell application \"Terminal\" to do script \"docker ps\""
+        let script = "tell application \"Terminal\"\nactivate\ndo script \"docker ps\"\nend tell"
         var error: NSDictionary?
         if let scriptObject = NSAppleScript(source: script) {
             scriptObject.executeAndReturnError(&error)
@@ -271,14 +271,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openLogs() {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: logPath) {
-            NSWorkspace.shared.open(URL(fileURLWithPath: logPath))
-        } else {
-            let alert = NSAlert()
-            alert.messageText = "日志文件尚未生成"
-            alert.informativeText = "路径: \(logPath)"
-            alert.runModal()
+        let script = "tell application \"Terminal\"\nactivate\ndo script \"tail -n 50 -f ~/.colima/_lima/colima/ha.stderr.log\"\nend tell"
+        var error: NSDictionary?
+        if let scriptObject = NSAppleScript(source: script) {
+            scriptObject.executeAndReturnError(&error)
         }
     }
 
