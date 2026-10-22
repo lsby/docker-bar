@@ -1,11 +1,12 @@
 import Cocoa
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var statusMenuItem: NSMenuItem!
     var startMenuItem: NSMenuItem!
     var stopMenuItem: NSMenuItem!
     var restartMenuItem: NSMenuItem!
+    var toggleContainersMenuItem: NSMenuItem!
     var terminalMenuItem: NSMenuItem!
     var logsMenuItem: NSMenuItem!
     var quitMenuItem: NSMenuItem!
@@ -13,6 +14,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isBusy: Bool = false
     var watchdogPipe: Pipe?
     var watchdogProcess: Process?
+
+    // 记录由 DockerBar 主动挂起的容器 ID，确保恢复时只恢复这批容器
+    var pausedByDockerBarIds: Set<String> = []
 
     // 动态检索 colima 与 docker 路径
     lazy var colimaPath: String = {
@@ -29,6 +33,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return "colima"
+    }()
+
+    lazy var dockerPath: String = {
+        let candidates = [
+            NSHomeDirectory() + "/.homebrew/bin/docker",
+            "/opt/homebrew/bin/docker",
+            "/usr/local/bin/docker",
+            "/usr/bin/docker"
+        ]
+        let fm = FileManager.default
+        for path in candidates {
+            if fm.fileExists(atPath: path) {
+                return path
+            }
+        }
+        return "docker"
     }()
 
     lazy var dockerSock: String = {
@@ -52,6 +72,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusDisplay(status: "starting")
 
         let menu = NSMenu()
+        menu.delegate = self
         statusMenuItem = NSMenuItem(title: "Docker 状态: 正在检测...", action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
@@ -68,6 +89,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         restartMenuItem = NSMenuItem(title: "重启 Docker (Restart)", action: #selector(restartDocker), keyEquivalent: "r")
         restartMenuItem.target = self
         menu.addItem(restartMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        toggleContainersMenuItem = NSMenuItem(title: "暂停所有容器 (Pause All)", action: #selector(toggleContainersPauseState), keyEquivalent: "p")
+        toggleContainersMenuItem.target = self
+        toggleContainersMenuItem.isEnabled = false
+        menu.addItem(toggleContainersMenuItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -146,6 +174,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func reclaimDockerProcesses() {
+        self.pausedByDockerBarIds.removeAll()
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: dockerSock) {
             let task = Process()
@@ -168,6 +197,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.startMenuItem.isEnabled = false
                     self.stopMenuItem.isEnabled = true
                     self.restartMenuItem.isEnabled = true
+                    if !self.pausedByDockerBarIds.isEmpty {
+                        self.toggleContainersMenuItem.title = "恢复暂停的容器 (Resume) [\(self.pausedByDockerBarIds.count)]"
+                        self.toggleContainersMenuItem.isEnabled = true
+                    } else {
+                        self.toggleContainersMenuItem.title = "暂停所有容器 (Pause All)"
+                        self.toggleContainersMenuItem.isEnabled = true
+                    }
                     self.quitMenuItem.title = "退出并停止 Docker (Quit)"
                 case "stopped":
                     button.title = "🐳 ⚪️"
@@ -175,6 +211,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.startMenuItem.isEnabled = true
                     self.stopMenuItem.isEnabled = false
                     self.restartMenuItem.isEnabled = false
+                    self.pausedByDockerBarIds.removeAll()
+                    self.toggleContainersMenuItem.title = "暂停所有容器 (Pause All)"
+                    self.toggleContainersMenuItem.isEnabled = false
                     self.quitMenuItem.title = "退出托盘 (Quit)"
                 case "starting":
                     button.title = "🐳 🟡"
@@ -182,6 +221,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.startMenuItem.isEnabled = false
                     self.stopMenuItem.isEnabled = false
                     self.restartMenuItem.isEnabled = false
+                    self.pausedByDockerBarIds.removeAll()
+                    self.toggleContainersMenuItem.title = "暂停所有容器 (Pause All)"
+                    self.toggleContainersMenuItem.isEnabled = false
                     self.quitMenuItem.title = "退出托盘 (Quit)"
                 case "stopping":
                     button.title = "🐳 🟡"
@@ -189,10 +231,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.startMenuItem.isEnabled = false
                     self.stopMenuItem.isEnabled = false
                     self.restartMenuItem.isEnabled = false
+                    self.pausedByDockerBarIds.removeAll()
+                    self.toggleContainersMenuItem.title = "暂停所有容器 (Pause All)"
+                    self.toggleContainersMenuItem.isEnabled = false
                     self.quitMenuItem.title = "正在退出..."
                 default:
                     button.title = "🐳 ⚪️"
                     self.statusMenuItem.title = "Docker 状态: ⚪️ 检查中"
+                    self.toggleContainersMenuItem.isEnabled = false
                 }
             }
         }
@@ -262,6 +308,187 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - 容器级别智能挂起与专属恢复 (Toggle Pause / Resume)
+
+    func menuWillOpen(_ menu: NSMenu) {
+        if FileManager.default.fileExists(atPath: self.dockerSock) && !isBusy {
+            refreshContainersCount()
+        }
+    }
+
+    func refreshContainersCount() {
+        guard FileManager.default.fileExists(atPath: self.dockerSock) else {
+            DispatchQueue.main.async {
+                self.pausedByDockerBarIds.removeAll()
+                self.toggleContainersMenuItem?.title = "暂停所有容器 (Pause All)"
+                self.toggleContainersMenuItem?.isEnabled = false
+            }
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let script = """
+            export PATH="$HOME/.homebrew/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+            export DOCKER_HOST="unix://\(self.dockerSock)"
+            RUNNING=$(\(self.dockerPath) ps -q --filter "status=running" 2>/dev/null | grep -c . || true)
+            PAUSED_IDS=$(\(self.dockerPath) ps -q --filter "status=paused" 2>/dev/null)
+            echo "---SEP---"
+            echo "$RUNNING"
+            echo "---SEP---"
+            echo "$PAUSED_IDS"
+            """
+            let task = Process()
+            task.launchPath = "/bin/sh"
+            task.arguments = ["-c", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let output = String(data: data, encoding: .utf8) {
+                    let parts = output.components(separatedBy: "---SEP---")
+                    if parts.count >= 3 {
+                        let runningCount = Int(parts[1].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+                        let pausedList = parts[2].components(separatedBy: .newlines)
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                        let currentPausedSet = Set(pausedList)
+
+                        DispatchQueue.main.async {
+                            if !self.pausedByDockerBarIds.isEmpty {
+                                // 已经处于由 DockerBar 暂停的状态，校验哪些容器仍然处于 paused 状态
+                                let validPaused = self.pausedByDockerBarIds.intersection(currentPausedSet)
+                                if validPaused.isEmpty {
+                                    // 之前暂停的容器已经被外部恢复或停止了，自动回到初始状态
+                                    self.pausedByDockerBarIds.removeAll()
+                                    self.toggleContainersMenuItem?.title = "暂停所有容器 (Pause All) [\(runningCount)]"
+                                    self.toggleContainersMenuItem?.isEnabled = (runningCount > 0)
+                                } else {
+                                    self.pausedByDockerBarIds = validPaused
+                                    self.toggleContainersMenuItem?.title = "恢复暂停的容器 (Resume) [\(validPaused.count)]"
+                                    self.toggleContainersMenuItem?.isEnabled = true
+                                }
+                            } else {
+                                // 当前处于未暂停状态
+                                self.toggleContainersMenuItem?.title = "暂停所有容器 (Pause All) [\(runningCount)]"
+                                self.toggleContainersMenuItem?.isEnabled = (runningCount > 0)
+                            }
+                        }
+                    }
+                }
+            } catch {
+                NSLog("[DockerBar] 检测容器状态失败: \(error)")
+            }
+        }
+    }
+
+    @objc func toggleContainersPauseState() {
+        if isBusy { return }
+        if !pausedByDockerBarIds.isEmpty {
+            resumePreviouslyPausedContainers()
+        } else {
+            pauseAllRunningContainers()
+        }
+    }
+
+    func pauseAllRunningContainers() {
+        NSLog("[DockerBar] 触发一键挂起所有运行中容器...")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let script = """
+            export PATH="$HOME/.homebrew/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+            export DOCKER_HOST="unix://\(self.dockerSock)"
+            \(self.dockerPath) ps -q --filter "status=running" 2>/dev/null
+            """
+            let task = Process()
+            task.launchPath = "/bin/sh"
+            task.arguments = ["-c", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let ids = output.components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+
+                if !ids.isEmpty {
+                    let pauseScript = """
+                    export PATH="$HOME/.homebrew/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+                    export DOCKER_HOST="unix://\(self.dockerSock)"
+                    echo "\(ids.joined(separator: " "))" | xargs \(self.dockerPath) pause 2>/dev/null
+                    """
+                    let pauseTask = Process()
+                    pauseTask.launchPath = "/bin/sh"
+                    pauseTask.arguments = ["-c", pauseScript]
+                    try pauseTask.run()
+                    pauseTask.waitUntilExit()
+
+                    DispatchQueue.main.async {
+                        self.pausedByDockerBarIds = Set(ids)
+                        self.toggleContainersMenuItem?.title = "恢复暂停的容器 (Resume) [\(ids.count)]"
+                        self.toggleContainersMenuItem?.isEnabled = true
+                        NSLog("[DockerBar] 成功挂起 \(ids.count) 个容器，已记录专属恢复 ID: \(self.pausedByDockerBarIds)")
+                    }
+                }
+            } catch {
+                NSLog("[DockerBar] 执行暂停容器出错: \(error)")
+            }
+            self.refreshContainersCount()
+        }
+    }
+
+    func resumePreviouslyPausedContainers() {
+        let targets = self.pausedByDockerBarIds
+        NSLog("[DockerBar] 准备恢复由 DockerBar 暂停的容器，记录目标: \(targets)")
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 先获取当前确实还处于 paused 状态的容器，取交集，确保绝不误恢复其它容器
+            let script = """
+            export PATH="$HOME/.homebrew/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+            export DOCKER_HOST="unix://\(self.dockerSock)"
+            \(self.dockerPath) ps -q --filter "status=paused" 2>/dev/null
+            """
+            let task = Process()
+            task.launchPath = "/bin/sh"
+            task.arguments = ["-c", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let currentPaused = Set(output.components(separatedBy: .newlines)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty })
+
+                let toResume = targets.intersection(currentPaused)
+                if !toResume.isEmpty {
+                    let unpauseScript = """
+                    export PATH="$HOME/.homebrew/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+                    export DOCKER_HOST="unix://\(self.dockerSock)"
+                    echo "\(Array(toResume).joined(separator: " "))" | xargs \(self.dockerPath) unpause 2>/dev/null
+                    """
+                    let unpauseTask = Process()
+                    unpauseTask.launchPath = "/bin/sh"
+                    unpauseTask.arguments = ["-c", unpauseScript]
+                    try unpauseTask.run()
+                    unpauseTask.waitUntilExit()
+                    NSLog("[DockerBar] 成功恢复专属容器: \(toResume)")
+                }
+            } catch {
+                NSLog("[DockerBar] 执行恢复容器出错: \(error)")
+            }
+
+            DispatchQueue.main.async {
+                self.pausedByDockerBarIds.removeAll()
+                self.toggleContainersMenuItem?.title = "暂停所有容器 (Pause All)"
+            }
+            self.refreshContainersCount()
+        }
+    }
+
     @objc func openTerminal() {
         let task = Process()
         task.launchPath = "/usr/bin/osascript"
@@ -285,7 +512,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "DockerBar v1.0.0"
-        alert.informativeText = "极轻量、原生的 macOS 状态栏 Docker 容器生命周期管理工具。\n\n特点：\n• 进程强生命周期绑定（退出即彻底释放资源）\n• 内核管道看门狗防孤儿进程\n• 极低内存常驻 (~15MB)\n\n开源协议: MIT License"
+        alert.informativeText = "极轻量、原生的 macOS 状态栏 Docker 容器生命周期管理工具。\n\n特点：\n• 进程强生命周期绑定（退出即彻底释放资源）\n• 内核管道看门狗防孤儿进程\n• 一键冻结与秒级唤醒容器 (Pause / Resume)\n• 极低内存常驻 (~15MB)\n\n开源协议: MIT License"
         alert.addButton(withTitle: "确定")
         alert.runModal()
     }
