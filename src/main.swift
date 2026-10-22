@@ -51,13 +51,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "docker"
     }()
 
-    lazy var dockerSock: String = {
+    // 每次实时检测（首次启动前 socket 尚不存在，不能缓存）
+    var dockerSock: String {
         let primary = NSHomeDirectory() + "/.colima/default/docker.sock"
         let fallback = NSHomeDirectory() + "/.colima/docker.sock"
         if FileManager.default.fileExists(atPath: primary) {
             return primary
         }
         return fallback
+    }
+
+    // 清理上次异常退出残留的 SSH 复用连接、网络进程和 socket，否则下次 colima start 会卡死
+    static let cleanupScript = """
+    if ! colima status >/dev/null 2>&1; then
+        L="$HOME/.colima/_lima"
+        pkill -f "ssh: $L/colima/ssh.sock" 2>/dev/null
+        pkill -f "limactl hostagent .*$L/colima/" 2>/dev/null
+        pkill -f "limactl usernet .*$L/_networks/" 2>/dev/null
+        rm -f "$L/colima/ssh.sock" "$L/colima/ha.sock" "$L/colima/ha.pid" "$L/colima/vz.pid"
+        rm -f "$L"/_networks/*/*.pid "$L"/_networks/*/*.sock
+    fi
+    """
+
+    func runCleanup() {
+        let task = Process()
+       task.environment = AppDelegate.toolEnvironment
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", AppDelegate.cleanupScript]
+        try? task.run()
+        task.waitUntilExit()
+    }
+
+    // GUI 应用继承的 PATH 不含 Homebrew，colima 需要找到 limactl / docker
+    static let toolEnvironment: [String: String] = {
+        var env = ProcessInfo.processInfo.environment
+        let extra = ["/opt/homebrew/bin", "/usr/local/bin", NSHomeDirectory() + "/.homebrew/bin"]
+        env["PATH"] = (extra + [env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"]).joined(separator: ":")
+        return env
     }()
 
     lazy var logPath: String = {
@@ -138,6 +168,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     static func handleSignalExit() {
         let task = Process()
+       task.environment = AppDelegate.toolEnvironment
         task.launchPath = "/bin/sh"
         task.arguments = ["-c", "colima stop 2>/dev/null"]
         try? task.run()
@@ -150,18 +181,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.watchdogPipe = pipe
 
         let process = Process()
+       process.environment = AppDelegate.toolEnvironment
         process.launchPath = "/bin/sh"
         let script = """
         cat > /dev/null
         # 管道被操作系统内核关闭（主程序正常退出、闪退或被强杀）
+        # 先让 colima 正常关闭；20 秒内没关掉再强杀，避免留下孤儿进程
         HA_PID=$(cat "$HOME/.colima/_lima/colima/ha.pid" 2>/dev/null)
         VZ_PID=$(cat "$HOME/.colima/_lima/colima/vz.pid" 2>/dev/null)
-        [ -n "$HA_PID" ] && kill -TERM "$HA_PID" 2>/dev/null
-        [ -n "$VZ_PID" ] && kill -TERM "$VZ_PID" 2>/dev/null
-        colima stop 2>/dev/null || \(colimaPath) stop 2>/dev/null
-        sleep 2
-        [ -n "$HA_PID" ] && kill -9 "$HA_PID" 2>/dev/null
-        [ -n "$VZ_PID" ] && kill -9 "$VZ_PID" 2>/dev/null
+        colima stop 2>/dev/null &
+        STOP_PID=$!
+        for i in $(seq 1 20); do kill -0 "$STOP_PID" 2>/dev/null || break; sleep 1; done
+        if kill -0 "$STOP_PID" 2>/dev/null; then
+            kill "$STOP_PID" 2>/dev/null
+            [ -n "$HA_PID" ] && kill -TERM "$HA_PID" 2>/dev/null
+            [ -n "$VZ_PID" ] && kill -TERM "$VZ_PID" 2>/dev/null
+            sleep 2
+            [ -n "$HA_PID" ] && kill -9 "$HA_PID" 2>/dev/null
+            [ -n "$VZ_PID" ] && kill -9 "$VZ_PID" 2>/dev/null
+        fi
+        \(AppDelegate.cleanupScript)
         """
         process.arguments = ["-c", script]
         process.standardInput = pipe
@@ -178,6 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: dockerSock) {
             let task = Process()
+           task.environment = AppDelegate.toolEnvironment
             task.launchPath = colimaPath
             task.arguments = ["stop"]
             do {
@@ -262,7 +302,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isBusy = true
         updateStatusDisplay(status: "starting")
         DispatchQueue.global(qos: .userInitiated).async {
+            self.runCleanup()
             let task = Process()
+           task.environment = AppDelegate.toolEnvironment
             task.launchPath = self.colimaPath
             task.arguments = ["start"]
             do {
@@ -280,6 +322,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusDisplay(status: "stopping")
         DispatchQueue.global(qos: .userInitiated).async {
             let task = Process()
+           task.environment = AppDelegate.toolEnvironment
             task.launchPath = self.colimaPath
             task.arguments = ["stop"]
             do {
@@ -296,7 +339,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isBusy = true
         updateStatusDisplay(status: "starting")
         DispatchQueue.global(qos: .userInitiated).async {
+            self.runCleanup()
             let task = Process()
+           task.environment = AppDelegate.toolEnvironment
             task.launchPath = self.colimaPath
             task.arguments = ["restart"]
             do {
@@ -337,6 +382,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             echo "$PAUSED_IDS"
             """
             let task = Process()
+            task.environment = AppDelegate.toolEnvironment
             task.launchPath = "/bin/sh"
             task.arguments = ["-c", script]
             let pipe = Pipe()
@@ -400,6 +446,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             \(self.dockerPath) ps -q --filter "status=running" 2>/dev/null
             """
             let task = Process()
+            task.environment = AppDelegate.toolEnvironment
             task.launchPath = "/bin/sh"
             task.arguments = ["-c", script]
             let pipe = Pipe()
@@ -420,6 +467,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     echo "\(ids.joined(separator: " "))" | xargs \(self.dockerPath) pause 2>/dev/null
                     """
                     let pauseTask = Process()
+                    pauseTask.environment = AppDelegate.toolEnvironment
                     pauseTask.launchPath = "/bin/sh"
                     pauseTask.arguments = ["-c", pauseScript]
                     try pauseTask.run()
@@ -450,6 +498,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             \(self.dockerPath) ps -q --filter "status=paused" 2>/dev/null
             """
             let task = Process()
+            task.environment = AppDelegate.toolEnvironment
             task.launchPath = "/bin/sh"
             task.arguments = ["-c", script]
             let pipe = Pipe()
@@ -471,6 +520,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     echo "\(Array(toResume).joined(separator: " "))" | xargs \(self.dockerPath) unpause 2>/dev/null
                     """
                     let unpauseTask = Process()
+                    unpauseTask.environment = AppDelegate.toolEnvironment
                     unpauseTask.launchPath = "/bin/sh"
                     unpauseTask.arguments = ["-c", unpauseScript]
                     try unpauseTask.run()
@@ -491,6 +541,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openTerminal() {
         let task = Process()
+       task.environment = AppDelegate.toolEnvironment
         task.launchPath = "/usr/bin/osascript"
         task.arguments = [
             "-e", "tell application \"Terminal\" to activate",
@@ -501,6 +552,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openLogs() {
         let task = Process()
+       task.environment = AppDelegate.toolEnvironment
         task.launchPath = "/usr/bin/osascript"
         task.arguments = [
             "-e", "tell application \"Terminal\" to activate",
